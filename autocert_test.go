@@ -140,24 +140,19 @@ func TestGetCertificate_ForceRSA(t *testing.T) {
 	}
 }
 
-// tests man.GetCertificate flow using the provided hello argument.
-// The domain argument is the expected domain name of a certificate request.
-func testGetCertificate(t *testing.T, man *Manager, domain string, hello *tls.ClientHelloInfo) {
-	// echo token-02 | shasum -a 256
-	// then divide result in 2 parts separated by dot
-	tokenCertName := "4e8eb87631187e9ff2153b56b13a4dec.13a35d002e485d60ff37354b32f665d9.token.acme.invalid"
-	verifyTokenCert := func() {
-		hello := &tls.ClientHelloInfo{ServerName: tokenCertName}
-		_, err := man.GetCertificate(hello)
-		if err != nil {
-			t.Errorf("verifyTokenCert: GetCertificate(%q): %v", tokenCertName, err)
-			return
-		}
-	}
-
-	// ACME CA server stub
+// ACME CA server stub
+func simulateCA(t *testing.T, man *Manager, tokenCertName, domain string) *httptest.Server {
 	var ca *httptest.Server
 	ca = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		verifyTokenCert := func() {
+			hello := &tls.ClientHelloInfo{ServerName: tokenCertName}
+			_, err := man.GetCertificate(hello)
+			if err != nil {
+				t.Errorf("verifyTokenCert: GetCertificate(%q): %v", tokenCertName, err)
+				return
+			}
+		}
+
 		w.Header().Set("replay-nonce", "nonce")
 		if r.Method == "HEAD" {
 			// a nonce request
@@ -220,6 +215,18 @@ func testGetCertificate(t *testing.T, man *Manager, domain string, hello *tls.Cl
 			t.Errorf("unrecognized r.URL.Path: %s", r.URL.Path)
 		}
 	}))
+	return ca
+}
+
+// tests man.GetCertificate flow using the provided hello argument.
+// The domain argument is the expected domain name of a certificate request.
+func testGetCertificate(t *testing.T, man *Manager, domain string, hello *tls.ClientHelloInfo) {
+	// echo token-02 | shasum -a 256
+	// then divide result in 2 parts separated by dot
+	tokenCertName := "4e8eb87631187e9ff2153b56b13a4dec.13a35d002e485d60ff37354b32f665d9.token.acme.invalid"
+
+	// ACME CA server stub
+	ca := simulateCA(t, man, tokenCertName, domain)
 	defer ca.Close()
 
 	// use EC key to run faster on 386
@@ -246,6 +253,85 @@ func testGetCertificate(t *testing.T, man *Manager, domain string, hello *tls.Cl
 	}
 	if err != nil {
 		t.Fatalf("man.GetCertificate: %v", err)
+	}
+
+	// verify the tlscert is the same we responded with from the CA stub
+	if len(tlscert.Certificate) == 0 {
+		t.Fatal("len(tlscert.Certificate) is 0")
+	}
+	cert, err := x509.ParseCertificate(tlscert.Certificate[0])
+	if err != nil {
+		t.Fatalf("x509.ParseCertificate: %v", err)
+	}
+	if len(cert.DNSNames) == 0 || cert.DNSNames[0] != domain {
+		t.Errorf("cert.DNSNames = %v; want %q", cert.DNSNames, domain)
+	}
+
+	// make sure token cert was removed
+	done = make(chan struct{})
+	go func() {
+		for {
+			hello := &tls.ClientHelloInfo{ServerName: tokenCertName}
+			if _, err := man.GetCertificate(hello); err != nil {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		close(done)
+	}()
+	select {
+	case <-time.After(5 * time.Second):
+		t.Error("token cert was not removed")
+	case <-done:
+	}
+}
+
+func TestGetCertificateFromCSR(t *testing.T) {
+	const domain = "example.org"
+	man := &Manager{Prompt: AcceptTOS}
+	defer man.stopRenew()
+
+	// echo token-02 | shasum -a 256
+	// then divide result in 2 parts separated by dot
+	tokenCertName := "4e8eb87631187e9ff2153b56b13a4dec.13a35d002e485d60ff37354b32f665d9.token.acme.invalid"
+
+	// ACME CA server stub
+	ca := simulateCA(t, man, tokenCertName, domain)
+	defer ca.Close()
+
+	// use EC key to run faster on 386
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	man.Client = &acme.Client{
+		Key:          key,
+		DirectoryURL: ca.URL,
+	}
+
+	key2, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	csr, err := certRequest(key2, domain)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// simulate tls.Config.GetCertificate
+	var tlscert *tls.Certificate
+	done := make(chan struct{})
+	go func() {
+		tlscert, err = man.GetCertificateFromCSR(csr)
+		close(done)
+	}()
+	select {
+	case <-time.After(time.Minute):
+		t.Fatal("man.GetCertificateFromCSR took too long to return")
+	case <-done:
+	}
+	if err != nil {
+		t.Fatalf("man.GetCertificateFromCSR: %v", err)
 	}
 
 	// verify the tlscert is the same we responded with from the CA stub

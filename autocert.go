@@ -194,6 +194,26 @@ func (m *Manager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, 
 
 	// regular domain
 	name = strings.TrimSuffix(name, ".") // golang.org/issue/18114
+	return m.getCertificate(name, nil)
+}
+
+func findNameInCSR(csr []byte) (string, error) {
+	cr, err := x509.ParseCertificateRequest(csr)
+	if err != nil {
+		return "", fmt.Errorf("could not find server name: %v", err)
+	}
+	return cr.Subject.CommonName, nil
+}
+
+func (m *Manager) GetCertificateFromCSR(csr []byte) (*tls.Certificate, error) {
+	name, err := findNameInCSR(csr)
+	if err != nil {
+		return nil, err
+	}
+	return m.getCertificate(name, csr)
+}
+
+func (m *Manager) getCertificate(name string, csr []byte) (*tls.Certificate, error) {
 	cert, err := m.cert(name)
 	if err == nil {
 		return cert, nil
@@ -207,7 +227,7 @@ func (m *Manager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, 
 	if err := m.hostPolicy()(ctx, name); err != nil {
 		return nil, err
 	}
-	cert, err = m.createCert(ctx, name)
+	cert, err = m.createCert(ctx, name, csr)
 	if err != nil {
 		return nil, err
 	}
@@ -348,9 +368,10 @@ func encodeECDSAKey(w io.Writer, key *ecdsa.PrivateKey) error {
 //
 // If the domain is already being verified, it waits for the existing verification to complete.
 // Either way, createCert blocks for the duration of the whole process.
-func (m *Manager) createCert(ctx context.Context, domain string) (*tls.Certificate, error) {
+func (m *Manager) createCert(ctx context.Context, domain string, csr []byte) (*tls.Certificate, error) {
 	// TODO: maybe rewrite this whole piece using sync.Once
-	state, err := m.certState(domain)
+	csrOnly := (csr != nil)
+	state, err := m.certState(domain, csrOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +389,7 @@ func (m *Manager) createCert(ctx context.Context, domain string) (*tls.Certifica
 	defer state.Unlock()
 	state.locked = false
 
-	der, leaf, err := m.authorizedCert(ctx, state.key, domain)
+	der, leaf, err := m.authorizedCert(ctx, state.key, domain, csr)
 	if err != nil {
 		return nil, err
 	}
@@ -381,7 +402,7 @@ func (m *Manager) createCert(ctx context.Context, domain string) (*tls.Certifica
 // certState returns a new or existing certState.
 // If a new certState is returned, state.exist is false and the state is locked.
 // The returned error is non-nil only in the case where a new state could not be created.
-func (m *Manager) certState(domain string) (*certState, error) {
+func (m *Manager) certState(domain string, csrOnly bool) (*certState, error) {
 	m.stateMu.Lock()
 	defer m.stateMu.Unlock()
 	if m.state == nil {
@@ -397,18 +418,21 @@ func (m *Manager) certState(domain string) (*certState, error) {
 		err error
 		key crypto.Signer
 	)
-	if m.ForceRSA {
-		key, err = rsa.GenerateKey(rand.Reader, 2048)
-	} else {
-		key, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	}
-	if err != nil {
-		return nil, err
+	if !csrOnly {
+		if m.ForceRSA {
+			key, err = rsa.GenerateKey(rand.Reader, 2048)
+		} else {
+			key, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	state := &certState{
-		key:    key,
-		locked: true,
+		csrOnly: csrOnly,
+		key:     key,
+		locked:  true,
 	}
 	state.Lock() // will be unlocked by m.certState caller
 	m.state[domain] = state
@@ -417,7 +441,7 @@ func (m *Manager) certState(domain string) (*certState, error) {
 
 // authorizedCert starts domain ownership verification process and requests a new cert upon success.
 // The key argument is the certificate private key.
-func (m *Manager) authorizedCert(ctx context.Context, key crypto.Signer, domain string) (der [][]byte, leaf *x509.Certificate, err error) {
+func (m *Manager) authorizedCert(ctx context.Context, key crypto.Signer, domain string, csr []byte) (der [][]byte, leaf *x509.Certificate, err error) {
 	// TODO: make m.verify retry or retry m.verify calls here
 	if err := m.verify(ctx, domain); err != nil {
 		return nil, nil, err
@@ -426,9 +450,12 @@ func (m *Manager) authorizedCert(ctx context.Context, key crypto.Signer, domain 
 	if err != nil {
 		return nil, nil, err
 	}
-	csr, err := certRequest(key, domain)
-	if err != nil {
-		return nil, nil, err
+	if csr == nil {
+		var err error
+		csr, err = certRequest(key, domain)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	der, _, err = client.CreateCert(ctx, csr, 0, true)
 	if err != nil {
@@ -653,16 +680,17 @@ func (m *Manager) renewBefore() time.Duration {
 // certState is ready when its mutex is unlocked for reading.
 type certState struct {
 	sync.RWMutex
-	locked bool              // locked for read/write
-	key    crypto.Signer     // private key for cert
-	cert   [][]byte          // DER encoding
-	leaf   *x509.Certificate // parsed cert[0]; always non-nil if cert != nil
+	locked  bool              // locked for read/write
+	key     crypto.Signer     // private key for cert
+	cert    [][]byte          // DER encoding
+	leaf    *x509.Certificate // parsed cert[0]; always non-nil if cert != nil
+	csrOnly bool
 }
 
 // tlscert creates a tls.Certificate from s.key and s.cert.
 // Callers should wrap it in s.RLock() and s.RUnlock().
 func (s *certState) tlscert() (*tls.Certificate, error) {
-	if s.key == nil {
+	if !s.csrOnly && s.key == nil {
 		return nil, errors.New("acme/autocert: missing signer")
 	}
 	if len(s.cert) == 0 {
@@ -742,6 +770,11 @@ func validCert(domain string, der [][]byte, key crypto.Signer) (leaf *x509.Certi
 	}
 	if err := leaf.VerifyHostname(domain); err != nil {
 		return nil, err
+	}
+
+	// In csr only case, do not check the public/private key
+	if key == nil {
+		return leaf, nil
 	}
 	// ensure the leaf corresponds to the private key
 	switch pub := leaf.PublicKey.(type) {
