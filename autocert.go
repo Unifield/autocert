@@ -395,7 +395,17 @@ func (m *Manager) createCert(ctx context.Context, domain string, csr []byte) (*t
 	}
 	state.cert = der
 	state.leaf = leaf
-	go m.renew(domain, state.key, state.leaf.NotAfter)
+	if csrOnly {
+		// for csr's, we do not keep the state around,
+		// since the next time it comes, it might have a different
+		// private key
+		m.stateMu.Lock()
+		delete(m.state, domain)
+		m.stateMu.Unlock()
+	} else {
+		// also: do not do renewal for csr's
+		go m.renew(domain, state.key, state.leaf.NotAfter)
+	}
 	return state.tlscert()
 }
 
